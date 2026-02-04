@@ -1,4 +1,3 @@
-
 #EventStore with Outbox Pattern
 """sumary_line
   This module handles:
@@ -7,9 +6,7 @@
   3. Optimistic concurrency control (version checking)
   4. Loading event history for an aggregate
   """
-  
-
-
+from aiokafka import AIOKafkaProducer # For Kafka integration - aiokafka = Async I/O Kafka- Works with async/await (matches our EventStore)- Non-blocking: can send messages while doing other work
 import json
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -230,12 +227,12 @@ class EventStore:
                      SELECT event_id, event_type, event_data, version, created_at
                      FROM events
                      WHERE aggregate_id = $1 AND tenant_id = $2
-                     ORDER BY version ASC  
-  #Why ORDER BY version ASC?
-  - Events MUST be replayed in exact order they happened
-  - Depositing then withdrawing ≠ withdrawing then depositing
-  - Version number guarantees correct sequence even if timestamps are identical
-                     """,
+                     ORDER BY version ASC
+                    """,
+                    # Why ORDER BY version ASC?
+                    # - Events MUST be replayed in exact order they happened
+                    # - Depositing then withdrawing ≠ withdrawing then depositing
+                    # - Version number guarantees correct sequence even if timestamps are identical
                      aggregate_id,
                      tenant_id
                  )
@@ -252,3 +249,84 @@ class EventStore:
                      }
                      events.append(event_dict)
                  return events
+
+# OUTBOX RELAY CLASS
+"""
+The OutboxRelay bridges the gap between database and Kafka.
+
+      Why separate from EventStore?
+        - Single Responsibility: EventStore saves, OutboxRelay delivers
+        - Can run independently (background worker)
+        - Can retry without affecting main application
+
+      This implements the "Polling Publisher" pattern:
+        - Poll outbox table periodically
+        - Send to Kafka
+        - Delete after successful send
+
+Guarantees "at-least-once" delivery to Kafka.
+"""
+class OutboxRelay:
+    """
+    Reads from outbox table and publishes to Kafka.
+    Runs as background worker to forward messages from outbox table to Kafka.
+    """
+
+    def __init__(self, db_pool: asyncpg.pool.Pool, kafka_producer: AIOKafkaProducer):
+        self.db_pool = db_pool  # Same database pool as EventStore (shared resource)
+        self.kafka_producer = kafka_producer  # Configured Kafka producer instance
+
+    async def process_outbox(self, batch_size: int = 100) -> int:
+        """
+        Reads pending messages and sends them to Kafka.
+
+        Args:
+            batch_size: Maximum messages to process per run (default 100)
+
+        Returns:
+            Number of successfully processed messages
+        """
+        async with self.db_pool.acquire() as conn:
+            # Step 1: Fetch pending messages (oldest first - FIFO)
+            rows = await conn.fetch(
+                """
+                SELECT id, event_id, aggregate_type, event_type, event_data, tenant_id
+                FROM outbox
+                ORDER BY created_at ASC
+                LIMIT $1
+                """,
+                batch_size
+            )
+
+            if not rows:
+                return 0  # No messages to process
+
+            processed_count = 0
+
+            for row in rows:
+                try:
+                    # Step 2: Build Kafka topic name from aggregate and event type
+                    topic = f"finance.{row['aggregate_type'].lower()}.events"
+
+                    # Step 3: Send to Kafka (wait for acknowledgment)
+                    await self.kafka_producer.send_and_wait(
+                        topic=topic,
+                        key=str(row['event_id']).encode('utf-8'),
+                        value=row['event_data'].encode('utf-8')
+                    )
+
+                    # Step 4: Delete only AFTER successful Kafka send
+                    await conn.execute(
+                        "DELETE FROM outbox WHERE id = $1",
+                        row['id']
+                    )
+
+                    processed_count += 1
+
+                except Exception as e:
+                    # Failed message stays in outbox for retry
+                    print(f"Error processing outbox message {row['id']}: {e}")
+                    continue
+
+            return processed_count
+                  
