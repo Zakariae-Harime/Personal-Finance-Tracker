@@ -11,7 +11,7 @@ from fastapi import FastAPI
 import asyncpg
 from aiokafka import AIOKafkaProducer
 from fastapi.middleware.cors import CORSMiddleware
-
+from src.api.routes.accounts import router as accounts_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """

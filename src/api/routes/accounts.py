@@ -57,8 +57,8 @@ async def create_account(
     )
     tenant_id = UUID("00000000-0000-0000-0000-000000000001")
 
-    await event_store.append_event(
-        aggregate_id= account_id,
+    await event_store.append_events(
+        aggregate_id=event.account_id,
         aggregate_type="Account",
         new_events=[event],
         expected_version=0,         
@@ -89,7 +89,7 @@ async def get_account(
      # Replay events to build current state
     first_event = events[0]
     event_data = first_event["event_data"]
-    return AccountCreated (
+    return AccountResponse(
      account_id=event_data["account_id"],
      name=event_data.get("account_name", "unknown"),
      currency=event_data.get("currency", "NOK"),

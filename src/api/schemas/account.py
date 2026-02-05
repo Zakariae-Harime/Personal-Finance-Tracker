@@ -74,7 +74,7 @@ class AccountCreatingRequest(BaseModel):
                 "initial_balance": "10000.00"
             }
         }
-    class AccountResponse(BaseModel):
+class AccountResponse(BaseModel):
         """
         Response after creating/fetching an account.
         """
@@ -87,10 +87,10 @@ class AccountCreatingRequest(BaseModel):
         account_type:AccountType
         class Config:
             from_attributes = True  # Allow creating from ORM objects
-    class AccountCreatedResponse(BaseModel):
+class AccountCreatedResponse(BaseModel):
         """
         Response after successfully creating an account.
         """
         account_id: UUID
-        status: "created"
+        status: str = "created"
         message: str = "Account created successfully"
