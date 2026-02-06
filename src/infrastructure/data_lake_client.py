@@ -217,3 +217,183 @@ class DataLakeClient:
                  all_events.append(row)
         return all_events
  # buffer is automatically garbage collected! No need to close or delete it.
+    def transform_bronze_to_silver(self, event_type: str, year: int, month: int, day: Optional[int] = None) -> str:
+            """
+             Transform raw Bronze data to cleaned Silver data.
+
+          Transformations:
+            1. Deduplicate by event_id
+            2. Parse event_data JSON into columns
+            3. Validate required fields
+            4. Add processing metadata
+
+          Args:
+              event_type: Type of events to process
+              year, month, day: Partition to process
+
+          Returns:
+              Path where Silver data was written
+          """
+            # Step 1: Read from Bronze
+            bronze_fs = self.get_filesystem_client("bronze")
+            bronze_path= f"events/{event_type}/year={year}/month={month:02d}/day={day:02d}"
+            #collect all events from bronze
+            all_events = []
+            paths = bronze_fs.get_paths(path=bronze_path, recursive=True)
+            for path_item in paths:
+                if path_item.name.endswith(".parquet"):
+                    file_client = bronze_fs.get_file_client(path_item.name)
+                    download = file_client.download_file()
+                    content=download.readall()
+                    table = pq.read_table(BytesIO(content))
+                    for row in table.to_pylist():
+                        all_events.append(row)
+            if not all_events:
+                print(f"No events found in {bronze_path}")
+                return ""
+            # transforme deduplicate events by event_id
+            seen_ids= set()
+            unique_events = []
+            for event in all_events:
+                if event["event_id"] not in seen_ids:
+                    seen_ids.add(event["event_id"])
+                    unique_events.append(event)
+            duplicates_removed = len(all_events) - len(unique_events) 
+            print(f"Deduplicated {duplicates_removed} events")
+            # Tranforme : Parse event_data JSON
+            enriched_events = []
+            for event in unique_events:
+                # Parse the JSON string into dict
+                event_data = json.loads(event.get('event_data', '{}'))
+                # Flatten into columns
+                enriched = {
+                    'event_id': event['event_id'],
+                    'event_type': event['event_type'],
+                    'aggregate_id': event.get('aggregate_id'),
+                    'tenant_id': event.get('tenant_id'),
+                    'created_at': event.get('created_at'),
+                    # Flattened from event_data
+                    'account_name': event_data.get('account_name'),
+                    'amount': event_data.get('amount'),
+                    'currency': event_data.get('currency'),
+                    'category': event_data.get('category'),
+                    # Processing metadata
+                    'processed_at': datetime.now(timezone.utc).isoformat(),
+                    'source_file': bronze_path,
+                }
+                enriched_events.append(enriched)
+                # Write to Silver layer
+                silver_fs = self.get_filesystem_client("silver")
+                silver_path = f"events/{event_type}/year={year}/month={month:02d}/day={day:02d}/silver_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+                filename = f"silver_{year}{month:02d}{day:02d}_{datetime.now().strftime('%H%M%S')}.parquet"
+                # Create Silver schema (enriched columns)
+                schema = pa.schema([
+                    ("event_id", pa.string()),
+                    ("event_type", pa.string()),
+                    ("aggregate_id", pa.string()),
+                    ("tenant_id", pa.string()),
+                    ("created_at", pa.timestamp("ms")),
+                    # Flattened fields from event_data
+                    ("account_name", pa.string()),
+                    ("amount", pa.float64()),
+                    ("currency", pa.string()),
+                    ("category", pa.string()),
+                    # Processing metadata
+                    ("processed_at", pa.timestamp("ms")),
+                    ("source_file", pa.string())
+                ])
+                # Convert to Parquet
+                arrays = {col.name: [e.get(col.name) for e in enriched_events] for col in schema}
+                table = pa.table(arrays, schema=schema)
+
+                buffer = BytesIO()
+                pq.write_table(table, buffer, compression='snappy')
+                 # Upload to Silver
+                directory_client = silver_fs.get_directory_client(silver_path)
+                try:
+                    directory_client.create_directory()
+                except:
+                    pass
+
+                file_client = directory_client.get_file_client(filename)
+                file_client.upload_data(buffer.getvalue(), overwrite=True)
+
+                full_path = f"{silver_path}/{filename}"
+                print(f"Silver data written: {len(enriched_events)} events to silver/{full_path}")
+                return full_path
+
+    #Gold layer transformations would go here (aggregations, etc.)
+    def transform_silver_to_gold(self, event_type: str, year: int, month: int) -> str:
+        """
+          Aggregate Silver data into Gold analytics tables.
+
+          Creates:
+            - Monthly spending by category
+            - Transaction counts
+            - Average transaction amounts
+
+          Args:
+              year, month: Month to aggregate
+
+          Returns:
+              Path where Gold data was written
+        """
+        import pandas as pd  # Use pandas for aggregations
+
+          # Read all Silver data for the month
+        silver_fs = self.get_filesystem_client("silver")
+        silver_path = f"TransactionCreated/year={year}/month={month:02d}"
+
+        all_data = []
+        try:
+              paths = silver_fs.get_paths(path=silver_path, recursive=True)
+              for path_item in paths:
+                  if path_item.name.endswith('.parquet'):
+                      file_client = silver_fs.get_file_client(path_item.name)
+                      content = file_client.download_file().readall()
+                      table = pq.read_table(BytesIO(content))
+                      all_data.extend(table.to_pylist())
+        except Exception as e:
+            print(f"No silver data found: {e}")
+            return ""
+
+        if not all_data:
+            return ""
+        # Convert to pandas DataFrame for easy aggregation
+        df = pd.DataFrame(all_data)
+        # Ensure amount is numeric
+        df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
+        # Monthly spending by category aggregation
+        summary = df.groupby('category').agg({
+        'amount': ['sum', 'mean', 'count'],
+        'event_id': 'nunique'  # Unique transactions
+         }).reset_index()
+        # Flatten column names 
+        summary.columns = ['category', 'total_amount', 'avg_amount', 'transaction_count', 'unique_events']
+        # Add metadata
+        summary['year'] = year
+        summary['month'] = month
+        summary['generated_at'] = datetime.now(timezone.utc).isoformat()
+
+        # Write to Gold layer
+        gold_fs = self.get_filesystem_client("gold")
+        gold_path = f"spending_by_category/year={year}/month={month:02d}"
+        filename = f"monthly_summary.parquet"
+
+        # Convert to PyArrow and write
+        table = pa.Table.from_pandas(summary)
+        buffer = BytesIO()
+        pq.write_table(table, buffer, compression='snappy')
+
+        directory_client = gold_fs.get_directory_client(gold_path)
+        try:
+            directory_client.create_directory()
+        except:
+              pass
+
+        file_client = directory_client.get_file_client(filename)
+        file_client.upload_data(buffer.getvalue(), overwrite=True)
+
+        full_path = f"{gold_path}/{filename}"
+        print(f"🥇 Gold data written: {len(summary)} categories to gold/{full_path}")
+        return full_path    
